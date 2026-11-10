@@ -49,167 +49,49 @@ from core.metrics import accuracy, get_prediction
 from core.attacks_and_models import JointClassifierDDPM, get_attack
 from models import get_classifier
 
+# M5 Adaptive Mask modules
+from adaptive_mask.config import AdaptiveMaskConfig
+from adaptive_mask.saliency import compute_saliency
+from adaptive_mask.mask_generator import generate_adaptive_mask
+from adaptive_mask.mask_refinement import refine_adaptive_mask
+from adaptive_mask.visualization import visualize_mask_pipeline
+
 import matplotlib
 matplotlib.use('Agg')
 
 
 # =======================================================
-# Adaptive Mask implementation (kept in this file)
+# M5 Grad-CAM target-layer discovery
 # =======================================================
 
-def compute_gradient_saliency(
-    images,
-    classifier,
-    target_index=0,
-    eps=1e-8,
-):
-    """
-    Compute input-gradient saliency for ACE classifier.
+def find_gradcam_target_layer(classifier):
+    """Find the final DenseNet121 convolution inside the ACE classifier."""
+    decision_model = None
+    for module in classifier.modules():
+        if module.__class__.__name__ == "DecisionDensenetModel":
+            decision_model = module
+            break
 
-    Supports:
-        - Multi-output classifier: [B, num_classes]
-        - Binary single-output classifier: [B] or [B, 1]
-
-    Returns:
-        Normalized saliency map [B, 1, H, W] in [0, 1].
-    """
-    if images.ndim != 4:
-        raise ValueError(
-            f"Expected images [B,C,H,W], got {tuple(images.shape)}"
+    if decision_model is None:
+        raise RuntimeError(
+            "Could not find DecisionDensenetModel inside classifier. "
+            "Inspect get_classifier(args) and update this function."
         )
 
-    with torch.enable_grad():
-        x = images.detach().requires_grad_(True)
-        output = classifier(x)
-
-        if isinstance(output, (tuple, list)):
-            output = output[0]
-
-        if isinstance(output, dict):
-            raise TypeError(
-                "Classifier returned a dict; expected a differentiable tensor."
-            )
-
-        if not torch.is_tensor(output):
-            raise TypeError(
-                f"Classifier must return a tensor, got {type(output)}"
-            )
-
-        # Convert single-output binary classifier to [B, 1].
-        if output.ndim == 1:
-            if output.shape[0] != images.shape[0]:
-                raise ValueError(
-                    f"Output batch size {output.shape[0]} "
-                    f"does not match input batch size {images.shape[0]}."
-                )
-            output = output.unsqueeze(1)
-
-        elif output.ndim == 0 and images.shape[0] == 1:
-            output = output.reshape(1, 1)
-
-        if output.ndim != 2:
-            raise ValueError(
-                f"Expected classifier output [B, num_outputs], "
-                f"got {tuple(output.shape)}"
-            )
-
-        if output.shape[0] != images.shape[0]:
-            raise ValueError(
-                f"Output batch size {output.shape[0]} "
-                f"does not match input batch size {images.shape[0]}."
-            )
-
-        num_outputs = output.shape[1]
-
-        if not (0 <= target_index < num_outputs):
-            raise ValueError(
-                f"adaptive_mask_target_index={target_index} is invalid. "
-                f"Classifier has {num_outputs} output(s); "
-                f"valid index: 0 to {num_outputs - 1}."
-            )
-
-        score = output[:, target_index].sum()
-
-        if not score.requires_grad:
-            raise RuntimeError(
-                "Classifier output has no gradient. "
-                "Check whether the classifier uses detach(), "
-                "no_grad(), or non-differentiable predictions."
-            )
-
-        gradients = torch.autograd.grad(
-            score,
-            x,
-            retain_graph=False,
-            create_graph=False,
-        )[0]
-
-    # Channel-averaged absolute input gradients.
-    saliency = gradients.abs().mean(dim=1, keepdim=True)
-
-    # Normalize each image independently.
-    flat = saliency.flatten(start_dim=1)
-
-    min_values = flat.min(dim=1)[0].view(-1, 1, 1, 1)
-    max_values = flat.max(dim=1)[0].view(-1, 1, 1, 1)
-
-    saliency = (
-        saliency - min_values
-    ) / (
-        max_values - min_values + eps
-    )
-
-    return saliency.detach()
-
-
-def generate_adaptive_mask(
-    saliency,
-    min_coverage=0.05,
-    max_coverage=0.35,
-    entropy_coverage_strength=0.20,
-):
-    """
-    Select high-saliency pixels using an image-adaptive coverage ratio.
-
-    Returns a binary mask [B,1,H,W]. A value of 1 marks salient/editable
-    pixels. The ACE preservation mask is its inverse.
-    """
-    if saliency.ndim != 4 or saliency.shape[1] != 1:
-        raise ValueError(
-            f"Expected saliency [B,1,H,W], got {tuple(saliency.shape)}"
+    try:
+        target_layer = (
+            decision_model.feat_extract.feat_extract
+            .features.denseblock4.denselayer16.conv2
         )
-    if not (0.0 < min_coverage <= max_coverage <= 1.0):
-        raise ValueError("Require 0 < min_coverage <= max_coverage <= 1.")
+    except AttributeError as exc:
+        raise RuntimeError(
+            "Expected DenseNet121 layer "
+            "features.denseblock4.denselayer16.conv2 was not found."
+        ) from exc
 
-    batch_size = saliency.shape[0]
-    flat = saliency.flatten(start_dim=1).clamp(0, 1)
-    eps = 1e-8
-
-    # Normalized entropy: diffuse saliency -> larger selected area;
-    # concentrated saliency -> smaller selected area.
-    probabilities = flat + eps
-    probabilities = probabilities / probabilities.sum(dim=1, keepdim=True)
-    entropy = -(probabilities * probabilities.log()).sum(dim=1)
-    max_entropy = math.log(max(flat.shape[1], 2))
-    normalized_entropy = (entropy / max_entropy).clamp(0, 1)
-
-    coverage = min_coverage + (
-        entropy_coverage_strength * normalized_entropy
-    )
-    coverage = coverage.clamp(min_coverage, max_coverage)
-
-    masks = []
-    num_pixels = flat.shape[1]
-    for i in range(batch_size):
-        k = max(1, min(num_pixels, int(round(float(coverage[i]) * num_pixels))))
-        indices = torch.topk(flat[i], k=k, largest=True, sorted=False).indices
-        mask_flat = torch.zeros_like(flat[i])
-        mask_flat[indices] = 1.0
-        masks.append(mask_flat.view(1, *saliency.shape[-2:]))
-
-    return torch.stack(masks, dim=0).to(
-        device=saliency.device, dtype=saliency.dtype
-    )
+    if not isinstance(target_layer, torch.nn.Module):
+        raise TypeError("Grad-CAM target layer is not a torch.nn.Module.")
+    return target_layer
 
 
 # =======================================================
@@ -255,12 +137,23 @@ def create_args():
         sampling_inpaint=0.15,
         sampling_dilation=15,
 
-        # Adaptive Mask
-        adaptive_mask=False,
-        adaptive_mask_target_index=1,
+        # M5 Adaptive Mask
+        adaptive_mask=True,
+        adaptive_mask_target_index=0,
         adaptive_mask_min_coverage=0.05,
-        adaptive_mask_max_coverage=0.35,
-        adaptive_mask_entropy_strength=0.20,
+        adaptive_mask_max_coverage=0.12,
+        adaptive_mask_entropy_strength=1.0,
+        adaptive_mask_saliency_method='gradcam',
+        adaptive_mask_refinement=True,
+        adaptive_mask_refinement_iterations=100,
+        adaptive_mask_refinement_lr=0.05,
+        adaptive_mask_entropy_weight=0.05,
+        adaptive_mask_tv_weight=0.02,
+        adaptive_mask_coverage_weight=10.0,
+        adaptive_mask_gaussian=True,
+        adaptive_mask_gaussian_kernel=5,
+        adaptive_mask_gaussian_sigma=1.0,
+        adaptive_mask_save_visualizations=True,
 
         # query and target label
         label_query=-1,
@@ -299,49 +192,103 @@ def filter_fn(
     inpaint,
     dilation,
     adaptive_mask_enabled=False,
-    adaptive_mask_target_index=1,
-    adaptive_mask_min_coverage=0.05,
-    adaptive_mask_max_coverage=0.35,
-    adaptive_mask_entropy_strength=0.20,
+    adaptive_mask_config=None,
+    adaptive_mask_target_layer=None,
+    adaptive_mask_refinement=True,
+    adaptive_mask_refinement_iterations=100,
+    adaptive_mask_refinement_lr=0.05,
+    adaptive_mask_coverage_weight=10.0,
+    adaptive_mask_save_dir=None,
+    visualization_prefix="sample",
 ):
     indices = list(range(steps))[::-1]
 
-    # Generate pre-explanation (PE).
+    # Generate pre-explanation (PE) using the original ACE attack.
     with torch.enable_grad():
         pe = attack.perturb(x, target)
 
-    # Generate preservation mask.
     if adaptive_mask_enabled:
-        # High-saliency pixels are treated as editable regions.
-        saliency = compute_gradient_saliency(
-            x.detach(),
-            classifier,
-            target_index=adaptive_mask_target_index,
-        )
-        adaptive_edit_mask = generate_adaptive_mask(
-            saliency,
-            min_coverage=adaptive_mask_min_coverage,
-            max_coverage=adaptive_mask_max_coverage,
-            entropy_coverage_strength=adaptive_mask_entropy_strength,
-        )
+        if adaptive_mask_config is None:
+            raise ValueError(
+                "adaptive_mask_config is required when adaptive_mask_enabled=True."
+            )
+        if (
+            adaptive_mask_config.saliency_method == "gradcam"
+            and adaptive_mask_target_layer is None
+        ):
+            raise ValueError("Grad-CAM target layer is missing.")
 
-        # In ACE, boolmask=1 is the region restored from the original image.
-        # Thus preserve the complement of the selected editable region.
+        # Call the outer classifier to preserve ACE preprocessing/normalization.
+        with torch.enable_grad():
+            saliency = compute_saliency(
+                images=x.detach(),
+                classifier_fn=classifier,
+                config=adaptive_mask_config,
+                target_layer=adaptive_mask_target_layer,
+            )
+
+            initial_edit_mask, mask_info = generate_adaptive_mask(
+                saliency,
+                config=adaptive_mask_config,
+                return_info=True,
+            )
+
+            if adaptive_mask_refinement:
+                refined_edit_mask, refinement_info = refine_adaptive_mask(
+                    initial_mask=initial_edit_mask,
+                    saliency=saliency,
+                    config=adaptive_mask_config,
+                    iterations=adaptive_mask_refinement_iterations,
+                    learning_rate=adaptive_mask_refinement_lr,
+                    coverage_weight=adaptive_mask_coverage_weight,
+                    apply_closing=False,
+                    remove_small_components=False,
+                    return_info=True,
+                )
+            else:
+                refined_edit_mask = initial_edit_mask
+                refinement_info = {}
+
+        # M5 mask: 1=editable. ACE boolmask: 1=preserve original.
+        adaptive_edit_mask = refined_edit_mask.detach().clamp(0, 1)
         boolmask = 1.0 - adaptive_edit_mask
         if inpaint == 0:
             boolmask = torch.zeros_like(boolmask)
-
-        # Save the selected editable region as the PE mask visualization.
         mask = adaptive_edit_mask
+
+        if adaptive_mask_save_dir is not None:
+            os.makedirs(adaptive_mask_save_dir, exist_ok=True)
+            for batch_index in range(x.shape[0]):
+                image_id = f"{visualization_prefix}_{batch_index:03d}"
+                figure_path = osp.join(
+                    adaptive_mask_save_dir, image_id + "_m5_pipeline.png"
+                )
+                fig = visualize_mask_pipeline(
+                    image=x[batch_index:batch_index + 1].detach(),
+                    saliency=saliency[batch_index:batch_index + 1].detach(),
+                    initial_mask=initial_edit_mask[batch_index:batch_index + 1].detach(),
+                    refined_mask=adaptive_edit_mask[batch_index:batch_index + 1].detach(),
+                    save_path=figure_path,
+                )
+                plt.close(fig)
+
+        print(
+            "[M5] target coverage:",
+            mask_info.get("target_coverage"),
+            "| generated coverage:",
+            mask_info.get("final_coverage"),
+            "| refined soft coverage:",
+            adaptive_edit_mask.mean(dim=(1, 2, 3)).detach().cpu().tolist(),
+        )
+
     else:
-        # Original ACE implementation, kept unchanged.
+        # Original ACE implementation, unchanged.
         mask, dil_mask = generate_mask(x, pe, dilation)
         boolmask = (dil_mask < inpaint).float()
 
     ce = (pe.detach() - 0.5) / 0.5
     orig = (x.detach() - 0.5) / 0.5
     noise_fn = torch.randn_like if stochastic else torch.zeros_like
-
     noise_x = None
 
     for idx, t in enumerate(indices):
@@ -373,7 +320,6 @@ def filter_fn(
     ce = (ce * 0.5) + 0.5
     ce = ce.clamp(0, 1)
     noise_x = ((noise_x * 0.5) + 0.5).clamp(0, 1)
-
     return ce, pe, noise_x, mask
 
 
@@ -450,12 +396,44 @@ def main():
     classifier = get_classifier(args)
     classifier.to(dist_util.dev()).eval()
 
+    adaptive_mask_config = None
+    adaptive_mask_target_layer = None
+    adaptive_mask_vis_dir = None
+
+    if args.adaptive_mask:
+        adaptive_mask_config = AdaptiveMaskConfig(
+            saliency_method=args.adaptive_mask_saliency_method,
+            target_index=args.adaptive_mask_target_index,
+            min_coverage=args.adaptive_mask_min_coverage,
+            max_coverage=args.adaptive_mask_max_coverage,
+            entropy_coverage_strength=args.adaptive_mask_entropy_strength,
+            entropy_enabled=True,
+            entropy_regularization_strength=args.adaptive_mask_entropy_weight,
+            tv_enabled=True,
+            tv_regularization_strength=args.adaptive_mask_tv_weight,
+            gaussian_smoothing_enabled=args.adaptive_mask_gaussian,
+            gaussian_kernel_size=args.adaptive_mask_gaussian_kernel,
+            gaussian_sigma=args.adaptive_mask_gaussian_sigma,
+        ).validate()
+
+        if adaptive_mask_config.saliency_method == "gradcam":
+            adaptive_mask_target_layer = find_gradcam_target_layer(classifier)
+
+        if args.adaptive_mask_save_visualizations:
+            adaptive_mask_vis_dir = osp.join(
+                args.output_path, "Results", args.exp_name, "m5_visualizations"
+            )
+            os.makedirs(adaptive_mask_vis_dir, exist_ok=True)
+
     if args.adaptive_mask:
         print(
-            '[Adaptive Mask] ENABLED | '
+            '[M5 Adaptive Mask] ENABLED | '
+            f'method={args.adaptive_mask_saliency_method}, '
             f'target_index={args.adaptive_mask_target_index}, '
             f'coverage=[{args.adaptive_mask_min_coverage}, '
-            f'{args.adaptive_mask_max_coverage}]'
+            f'{args.adaptive_mask_max_coverage}], '
+            f'refinement={args.adaptive_mask_refinement}, '
+            f'Grad-CAM layer={adaptive_mask_target_layer}'
         )
         if args.adaptive_mask_min_coverage > args.adaptive_mask_max_coverage:
             raise ValueError(
@@ -633,10 +611,14 @@ def main():
             inpaint=args.sampling_inpaint,
             dilation=args.sampling_dilation,
             adaptive_mask_enabled=args.adaptive_mask,
-            adaptive_mask_target_index=args.adaptive_mask_target_index,
-            adaptive_mask_min_coverage=args.adaptive_mask_min_coverage,
-            adaptive_mask_max_coverage=args.adaptive_mask_max_coverage,
-            adaptive_mask_entropy_strength=args.adaptive_mask_entropy_strength,
+            adaptive_mask_config=adaptive_mask_config,
+            adaptive_mask_target_layer=adaptive_mask_target_layer,
+            adaptive_mask_refinement=args.adaptive_mask_refinement,
+            adaptive_mask_refinement_iterations=args.adaptive_mask_refinement_iterations,
+            adaptive_mask_refinement_lr=args.adaptive_mask_refinement_lr,
+            adaptive_mask_coverage_weight=args.adaptive_mask_coverage_weight,
+            adaptive_mask_save_dir=adaptive_mask_vis_dir,
+            visualization_prefix=f"batch_{idx:05d}",
         )
 
         noise = (noise * 255).to(dtype=torch.uint8).detach().cpu()
