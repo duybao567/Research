@@ -176,27 +176,17 @@ def compute_gradcam_saliency(
     target_index: int = 0,
     normalize: bool = True,
     eps: float = 1e-8,
+    fallback_to_input_gradient: bool = True,
 ):
-    """Compute Grad-CAM saliency maps.
+    """
+    Compute Grad-CAM saliency maps with degeneracy detection.
 
-    Args:
-        images:
-            Input tensor [B,C,H,W].
-
-        classifier_fn:
-            Callable returning classifier logits.
-
-        target_layer:
-            Actual convolutional module inside the classifier.
-
-        target_index:
-            Target output index. Use 0 for scalar Smile logits.
-
-        normalize:
-            Normalize output maps to [0,1].
+    Grad-CAM is the primary method.
+    Input Gradient is used only for samples whose Grad-CAM
+    maps are invalid or spatially constant.
 
     Returns:
-        Grad-CAM maps [B,1,H,W].
+        Saliency maps [B,1,H,W].
     """
 
     _validate_images(images)
@@ -208,12 +198,7 @@ def compute_gradcam_saliency(
 
     activations = []
 
-    # -----------------------------------------------------
-    # 3.1 Capture feature maps
-    # -----------------------------------------------------
-
     def forward_hook(module, inputs, output):
-
         if not isinstance(output, torch.Tensor):
             raise TypeError(
                 "Grad-CAM target layer must return a Tensor."
@@ -221,8 +206,8 @@ def compute_gradcam_saliency(
 
         if output.ndim != 4:
             raise ValueError(
-                "Grad-CAM target layer must output [B,C,H,W]. "
-                f"Got {tuple(output.shape)}."
+                "Expected target layer output [B,C,H,W], "
+                f"got {tuple(output.shape)}."
             )
 
         activations.append(output)
@@ -232,19 +217,16 @@ def compute_gradcam_saliency(
     )
 
     try:
-
         x = images.detach()
 
         with torch.enable_grad():
 
-            # The input does not need gradients for Grad-CAM.
             logits = classifier_fn(x)
 
             if len(activations) != 1:
                 raise RuntimeError(
-                    "Expected target_layer to execute exactly once "
-                    f"but observed {len(activations)} executions. "
-                    "Select a layer that is called once per forward pass."
+                    "Expected target layer to execute once, "
+                    f"observed {len(activations)} executions."
                 )
 
             feature_maps = activations[0]
@@ -255,7 +237,6 @@ def compute_gradcam_saliency(
                 x.shape[0],
             )
 
-            # Gradient of target score w.r.t. feature maps.
             gradients = torch.autograd.grad(
                 scores.sum(),
                 feature_maps,
@@ -263,9 +244,9 @@ def compute_gradcam_saliency(
                 create_graph=False,
             )[0]
 
-        # -------------------------------------------------
-        # 3.2 Grad-CAM weighting
-        # -------------------------------------------------
+        # ==========================================
+        # 1. COMPUTE STANDARD GRAD-CAM
+        # ==========================================
 
         weights = gradients.mean(
             dim=(2, 3),
@@ -278,10 +259,6 @@ def compute_gradcam_saliency(
 
         cam = F.relu(cam)
 
-        # -------------------------------------------------
-        # 3.3 Resize to input resolution
-        # -------------------------------------------------
-
         cam = F.interpolate(
             cam,
             size=images.shape[-2:],
@@ -289,17 +266,117 @@ def compute_gradcam_saliency(
             align_corners=False,
         )
 
+        # ==========================================
+        # 2. DETECT INVALID CAM
+        # ==========================================
+
+        flat = cam.flatten(1)
+
+        cam_min = flat.min(dim=1).values
+        cam_max = flat.max(dim=1).values
+        cam_std = flat.std(dim=1, unbiased=False)
+
+        valid = (
+            torch.isfinite(flat).all(dim=1)
+            & ((cam_max - cam_min) > eps)
+            & (cam_std > eps)
+        )
+
+        invalid_indices = (
+            (~valid).nonzero(as_tuple=True)[0]
+        )
+
+        # ==========================================
+        # 3. NORMALIZE VALID CAM
+        # ==========================================
+
         if normalize:
-            cam = _normalize_saliency(
+            saliency = _normalize_saliency(
                 cam,
                 eps,
             )
+        else:
+            saliency = cam.clone()
 
-        return cam.detach()
+        # ==========================================
+        # 4. INPUT GRADIENT FALLBACK
+        # ==========================================
+
+        if len(invalid_indices) > 0:
+
+            print(
+                "[Grad-CAM WARNING] Degenerate CAM "
+                f"for batch indices: "
+                f"{invalid_indices.tolist()}"
+            )
+
+            print(
+                "[Grad-CAM DEBUG] CAM min:",
+                cam_min.tolist()
+            )
+
+            print(
+                "[Grad-CAM DEBUG] CAM max:",
+                cam_max.tolist()
+            )
+
+            print(
+                "[Grad-CAM DEBUG] CAM std:",
+                cam_std.tolist()
+            )
+
+            if not fallback_to_input_gradient:
+                raise RuntimeError(
+                    "Grad-CAM produced invalid saliency maps "
+                    f"for indices {invalid_indices.tolist()}."
+                )
+
+            fallback_images = x.index_select(
+                0,
+                invalid_indices,
+            )
+
+            fallback_saliency = compute_gradient_saliency(
+                images=fallback_images,
+                classifier_fn=classifier_fn,
+                target_index=target_index,
+                absolute=True,
+                normalize=True,
+                eps=eps,
+            )
+
+            fallback_std = fallback_saliency.flatten(1).std(
+                dim=1,
+                unbiased=False,
+            )
+
+            fallback_valid = (
+                torch.isfinite(fallback_saliency).flatten(1).all(dim=1)
+                & (fallback_std > eps)
+            )
+
+            if not fallback_valid.all():
+                failed = invalid_indices[
+                    ~fallback_valid
+                ].tolist()
+
+                raise RuntimeError(
+                    "Both Grad-CAM and Input Gradient "
+                    f"failed for batch indices {failed}."
+                )
+
+            # Replace only invalid samples.
+            saliency[invalid_indices] = fallback_saliency
+
+            print(
+                "[M5] Input Gradient fallback used for "
+                f"{len(invalid_indices)} sample(s)."
+            )
+
+        return saliency.detach()
 
     finally:
         handle.remove()
-
 
 # =========================================================
 # 4. CONFIG-BASED SALIENCY DISPATCHER
