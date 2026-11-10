@@ -57,53 +57,108 @@ matplotlib.use('Agg')
 # Adaptive Mask implementation (kept in this file)
 # =======================================================
 
-def compute_gradient_saliency(images, classifier, target_index, eps=1e-8):
+def compute_gradient_saliency(
+    images,
+    classifier,
+    target_index=0,
+    eps=1e-8,
+):
     """
-    Compute input-gradient saliency for a target classifier logit.
+    Compute input-gradient saliency for ACE classifier.
 
-    Args:
-        images: Tensor [B, C, H, W], expected in the classifier's normal
-                input range (same range as ACE input images).
-        classifier: ACE classifier returning logits [B, num_classes].
-        target_index: Index of the classifier output to explain.
+    Supports:
+        - Multi-output classifier: [B, num_classes]
+        - Binary single-output classifier: [B] or [B, 1]
 
     Returns:
         Normalized saliency map [B, 1, H, W] in [0, 1].
     """
     if images.ndim != 4:
-        raise ValueError(f"Expected images [B,C,H,W], got {tuple(images.shape)}")
+        raise ValueError(
+            f"Expected images [B,C,H,W], got {tuple(images.shape)}"
+        )
 
     with torch.enable_grad():
         x = images.detach().requires_grad_(True)
-        logits = classifier(x)
+        output = classifier(x)
 
-        if isinstance(logits, (tuple, list)):
-            logits = logits[0]
-        if isinstance(logits, dict):
-            raise TypeError("Classifier returned a dict; expected logits tensor.")
+        if isinstance(output, (tuple, list)):
+            output = output[0]
 
-        if logits.ndim != 2:
-            raise ValueError(
-                f"Expected classifier logits [B,num_classes], got {tuple(logits.shape)}"
-            )
-        if not (0 <= target_index < logits.shape[1]):
-            raise ValueError(
-                f"adaptive_mask_target_index={target_index} is invalid; "
-                f"classifier has {logits.shape[1]} output(s)."
+        if isinstance(output, dict):
+            raise TypeError(
+                "Classifier returned a dict; expected a differentiable tensor."
             )
 
-        score = logits[:, target_index].sum()
+        if not torch.is_tensor(output):
+            raise TypeError(
+                f"Classifier must return a tensor, got {type(output)}"
+            )
+
+        # Convert single-output binary classifier to [B, 1].
+        if output.ndim == 1:
+            if output.shape[0] != images.shape[0]:
+                raise ValueError(
+                    f"Output batch size {output.shape[0]} "
+                    f"does not match input batch size {images.shape[0]}."
+                )
+            output = output.unsqueeze(1)
+
+        elif output.ndim == 0 and images.shape[0] == 1:
+            output = output.reshape(1, 1)
+
+        if output.ndim != 2:
+            raise ValueError(
+                f"Expected classifier output [B, num_outputs], "
+                f"got {tuple(output.shape)}"
+            )
+
+        if output.shape[0] != images.shape[0]:
+            raise ValueError(
+                f"Output batch size {output.shape[0]} "
+                f"does not match input batch size {images.shape[0]}."
+            )
+
+        num_outputs = output.shape[1]
+
+        if not (0 <= target_index < num_outputs):
+            raise ValueError(
+                f"adaptive_mask_target_index={target_index} is invalid. "
+                f"Classifier has {num_outputs} output(s); "
+                f"valid index: 0 to {num_outputs - 1}."
+            )
+
+        score = output[:, target_index].sum()
+
+        if not score.requires_grad:
+            raise RuntimeError(
+                "Classifier output has no gradient. "
+                "Check whether the classifier uses detach(), "
+                "no_grad(), or non-differentiable predictions."
+            )
+
         gradients = torch.autograd.grad(
-            score, x, retain_graph=False, create_graph=False
+            score,
+            x,
+            retain_graph=False,
+            create_graph=False,
         )[0]
 
     # Channel-averaged absolute input gradients.
     saliency = gradients.abs().mean(dim=1, keepdim=True)
 
+    # Normalize each image independently.
     flat = saliency.flatten(start_dim=1)
+
     min_values = flat.min(dim=1)[0].view(-1, 1, 1, 1)
     max_values = flat.max(dim=1)[0].view(-1, 1, 1, 1)
-    saliency = (saliency - min_values) / (max_values - min_values + eps)
+
+    saliency = (
+        saliency - min_values
+    ) / (
+        max_values - min_values + eps
+    )
+
     return saliency.detach()
 
 
