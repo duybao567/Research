@@ -1,4 +1,3 @@
-
 """Gradient-based and Grad-CAM saliency estimation for ACE.
 
 Supported methods:
@@ -11,11 +10,29 @@ Expected input:
     target_layer: convolutional module used by Grad-CAM.
 
 The classifier_fn should apply exactly the same preprocessing
-as the original classifier.
+as the original classifier, and the classifier must be in eval().
+
+Key design points (fixes over the previous version):
+    1. Direction-aware scores for single-output classifiers.
+       A single logit z means "attribute present" when z > 0 and
+       "attribute absent" when z < 0. Explaining +z for a negative
+       prediction gives a CAM whose evidence is all negative, which
+       ReLU wipes out, leaving only border noise. By default we now
+       explain the PREDICTED side: score = sign(z) * z.
+    2. CAM validity is judged on the raw (pre-ReLU) CAM, relative to
+       its own magnitude, not with an absolute eps. A CAM whose positive
+       part is tiny compared with its negative part is degenerate and
+       triggers the fallback instead of being stretched to [0, 1].
+    3. Max-normalization (no min subtraction) so that background is not
+       lifted, and the target-layer output is cloned inside the hook so
+       downstream in-place ops (ReLU(inplace=True)) cannot corrupt it.
 """
 
 import torch
 import torch.nn.functional as F
+
+
+VALID_DIRECTIONS = ("predicted", "positive", "negative")
 
 
 # =========================================================
@@ -38,6 +55,14 @@ def _validate_images(images):
 
     if not torch.isfinite(images).all():
         raise ValueError("images contain NaN or Inf.")
+
+
+def _is_single_output(logits):
+    """True for [B] or [B,1] classifier outputs."""
+
+    return logits.ndim == 1 or (
+        logits.ndim == 2 and logits.shape[1] == 1
+    )
 
 
 def _select_target_scores(logits, target_index, batch_size):
@@ -80,28 +105,61 @@ def _select_target_scores(logits, target_index, batch_size):
     )
 
 
+def _directional_scores(logits, target_index, batch_size, direction):
+    """Select target scores and orient them for explanation.
+
+    direction:
+        "predicted": explain the side the model predicted.
+            Single-output: score = sign(logit) * logit (so a negative
+            prediction is explained by evidence for "attribute absent").
+        "positive": always explain +logit (evidence FOR the attribute).
+        "negative": always explain -logit (evidence AGAINST it).
+
+    For multi-output classifiers the selected class logit is used
+    as-is (the sign flip only makes sense for a single logit).
+
+    Returns:
+        scores [B], sign [B] (sign is +1 for multi-output).
+    """
+
+    if direction not in VALID_DIRECTIONS:
+        raise ValueError(
+            f"direction must be one of {VALID_DIRECTIONS}, "
+            f"got {direction!r}."
+        )
+
+    scores = _select_target_scores(logits, target_index, batch_size)
+
+    ones = torch.ones_like(scores.detach())
+
+    if not _is_single_output(logits) or direction == "positive":
+        sign = ones
+    elif direction == "negative":
+        sign = -ones
+    else:  # "predicted"
+        sign = torch.where(scores.detach() >= 0, ones, -ones)
+
+    return scores * sign, sign
+
+
 def _normalize_saliency(
     saliency,
     eps=1e-8,
 ):
-    """Normalize each saliency map independently to [0,1]."""
+    """Normalize each non-negative saliency map by its own maximum.
 
-    flat = saliency.flatten(1)
+    Max-normalization (no min subtraction) keeps the background at 0
+    instead of lifting it, which is what we want after ReLU.
+    """
 
-    minimum = flat.min(
-        dim=1,
-        keepdim=True,
-    ).values
+    flat = saliency.flatten(1).clamp_min(0.0)
 
     maximum = flat.max(
         dim=1,
         keepdim=True,
     ).values
 
-    normalized = (
-        (flat - minimum)
-        / (maximum - minimum).clamp_min(eps)
-    )
+    normalized = flat / maximum.clamp_min(eps)
 
     return normalized.view_as(saliency).clamp(0.0, 1.0)
 
@@ -117,6 +175,7 @@ def compute_gradient_saliency(
     absolute: bool = True,
     normalize: bool = True,
     eps: float = 1e-8,
+    direction: str = "predicted",
 ) -> torch.Tensor:
     """Compute input-gradient saliency.
 
@@ -132,10 +191,11 @@ def compute_gradient_saliency(
 
         logits = classifier_fn(x)
 
-        scores = _select_target_scores(
+        scores, _ = _directional_scores(
             logits,
             target_index,
             x.shape[0],
+            direction,
         )
 
         gradient = torch.autograd.grad(
@@ -177,16 +237,27 @@ def compute_gradcam_saliency(
     normalize: bool = True,
     eps: float = 1e-8,
     fallback_to_input_gradient: bool = True,
+    direction: str = "predicted",
+    min_cam_strength: float = 0.05,
+    return_info: bool = False,
 ):
-    """
-    Compute Grad-CAM saliency maps with degeneracy detection.
+    """Compute Grad-CAM saliency maps with degeneracy detection.
 
-    Grad-CAM is the primary method.
-    Input Gradient is used only for samples whose Grad-CAM
-    maps are invalid or spatially constant.
+    Args:
+        direction:
+            "predicted" (default), "positive" or "negative".
+            See _directional_scores.
+        min_cam_strength:
+            A CAM is considered degenerate when
+                max(relu(raw_cam)) / max(|raw_cam|) < min_cam_strength
+            i.e. when almost all of the layer's evidence points the
+            wrong way. This is a RELATIVE test, so it works regardless
+            of activation scale (unlike an absolute eps).
+        return_info:
+            If True, also return per-sample diagnostics.
 
     Returns:
-        Saliency maps [B,1,H,W].
+        Saliency maps [B,1,H,W]   (or (saliency, info) if return_info).
     """
 
     _validate_images(images)
@@ -210,7 +281,12 @@ def compute_gradcam_saliency(
                 f"got {tuple(output.shape)}."
             )
 
+        # Clone so later in-place ops (e.g. ReLU(inplace=True)) cannot
+        # modify the tensor we differentiate against. Returning the
+        # clone keeps it in the graph.
+        output = output.clone()
         activations.append(output)
+        return output
 
     handle = target_layer.register_forward_hook(
         forward_hook
@@ -231,10 +307,11 @@ def compute_gradcam_saliency(
 
             feature_maps = activations[0]
 
-            scores = _select_target_scores(
+            scores, sign = _directional_scores(
                 logits,
                 target_index,
                 x.shape[0],
+                direction,
             )
 
             gradients = torch.autograd.grad(
@@ -244,8 +321,11 @@ def compute_gradcam_saliency(
                 create_graph=False,
             )[0]
 
+        feature_maps = feature_maps.detach()
+        gradients = gradients.detach()
+
         # ==========================================
-        # 1. COMPUTE STANDARD GRAD-CAM
+        # 1. COMPUTE STANDARD GRAD-CAM (raw, pre-ReLU)
         # ==========================================
 
         weights = gradients.mean(
@@ -253,33 +333,25 @@ def compute_gradcam_saliency(
             keepdim=True,
         )
 
-        cam = (
+        raw_cam = (
             weights * feature_maps
         ).sum(dim=1, keepdim=True)
 
-        cam = F.relu(cam)
-
-        cam = F.interpolate(
-            cam,
-            size=images.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-
         # ==========================================
-        # 2. DETECT INVALID CAM
+        # 2. VALIDITY ON RAW CAM (relative test)
         # ==========================================
 
-        flat = cam.flatten(1)
+        raw_flat = raw_cam.flatten(1)
 
-        cam_min = flat.min(dim=1).values
-        cam_max = flat.max(dim=1).values
-        cam_std = flat.std(dim=1, unbiased=False)
+        pos_max = raw_flat.clamp_min(0.0).max(dim=1).values
+        abs_max = raw_flat.abs().max(dim=1).values
+
+        strength = pos_max / abs_max.clamp_min(eps)
 
         valid = (
-            torch.isfinite(flat).all(dim=1)
-            & ((cam_max - cam_min) > eps)
-            & (cam_std > eps)
+            torch.isfinite(raw_flat).all(dim=1)
+            & (abs_max > eps)
+            & (strength >= min_cam_strength)
         )
 
         invalid_indices = (
@@ -287,8 +359,17 @@ def compute_gradcam_saliency(
         )
 
         # ==========================================
-        # 3. NORMALIZE VALID CAM
+        # 3. RELU, UPSAMPLE, NORMALIZE
         # ==========================================
+
+        cam = F.relu(raw_cam)
+
+        cam = F.interpolate(
+            cam,
+            size=images.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
 
         if normalize:
             saliency = _normalize_saliency(
@@ -305,24 +386,16 @@ def compute_gradcam_saliency(
         if len(invalid_indices) > 0:
 
             print(
-                "[Grad-CAM WARNING] Degenerate CAM "
-                f"for batch indices: "
-                f"{invalid_indices.tolist()}"
+                "[Grad-CAM WARNING] Degenerate CAM for batch "
+                f"indices: {invalid_indices.tolist()}"
             )
-
             print(
-                "[Grad-CAM DEBUG] CAM min:",
-                cam_min.tolist()
+                "[Grad-CAM DEBUG] CAM strength (pos_max/abs_max):",
+                [round(v, 4) for v in strength.tolist()],
             )
-
             print(
-                "[Grad-CAM DEBUG] CAM max:",
-                cam_max.tolist()
-            )
-
-            print(
-                "[Grad-CAM DEBUG] CAM std:",
-                cam_std.tolist()
+                "[Grad-CAM DEBUG] score sign:",
+                sign.tolist(),
             )
 
             if not fallback_to_input_gradient:
@@ -343,6 +416,7 @@ def compute_gradcam_saliency(
                 absolute=True,
                 normalize=True,
                 eps=eps,
+                direction=direction,
             )
 
             fallback_std = fallback_saliency.flatten(1).std(
@@ -366,17 +440,30 @@ def compute_gradcam_saliency(
                 )
 
             # Replace only invalid samples.
-            saliency[invalid_indices] = fallback_saliency
+            saliency[invalid_indices] = fallback_saliency.to(
+                saliency.dtype
+            )
 
             print(
                 "[M5] Input Gradient fallback used for "
                 f"{len(invalid_indices)} sample(s)."
             )
 
-        return saliency.detach()
+        saliency = saliency.detach()
+
+        if return_info:
+            info = {
+                "score_sign": sign.detach(),
+                "cam_strength": strength.detach(),
+                "fallback_indices": invalid_indices.tolist(),
+            }
+            return saliency, info
+
+        return saliency
 
     finally:
         handle.remove()
+
 
 # =========================================================
 # 4. CONFIG-BASED SALIENCY DISPATCHER
@@ -393,11 +480,17 @@ def compute_saliency(
     Supported config.saliency_method:
         - "gradient"
         - "gradcam"
+
+    Optional config attributes (defaults used if absent):
+        - saliency_direction: "predicted" | "positive" | "negative"
+        - min_cam_strength: float, default 0.05
     """
 
     config.validate()
 
     method = config.saliency_method
+
+    direction = getattr(config, "saliency_direction", "predicted")
 
     if method == "gradient":
 
@@ -406,6 +499,7 @@ def compute_saliency(
             classifier_fn=classifier_fn,
             target_index=config.target_index,
             eps=config.eps,
+            direction=direction,
         )
 
     if method == "gradcam":
@@ -423,6 +517,8 @@ def compute_saliency(
             target_layer=target_layer,
             target_index=config.target_index,
             eps=config.eps,
+            direction=direction,
+            min_cam_strength=getattr(config, "min_cam_strength", 0.05),
         )
 
     raise ValueError(
