@@ -25,7 +25,6 @@ from guided_diffusion.script_util import (
 from guided_diffusion.sample_utils import (
     ImageSaver,
     SlowSingleLabel,
-    merge_all_chunks,
     ChunkedDataset,
 )
 from guided_diffusion.image_datasets import (
@@ -467,27 +466,10 @@ def main():
     # ---------------------------------------------------
 
     if args.merge_chunks:
-
-        merge_root = osp.abspath(
-            osp.expanduser(args.output_path)
+        raise NotImplementedError(
+            "Chunk merging is disabled in this version. "
+            "Please run with --merge_chunks=False."
         )
-
-        if (
-            osp.basename(
-                osp.normpath(merge_root)
-            ).lower() == "results"
-        ):
-            merge_root = osp.dirname(
-                osp.normpath(merge_root)
-            )
-
-        merge_all_chunks(
-            args.chunks,
-            merge_root,
-            args.exp_name,
-        )
-
-        return
 
     # ---------------------------------------------------
     # Validate configuration
@@ -1048,19 +1030,19 @@ def main():
                 data_log, data_pred = get_prediction(
                     classifier,
                     data_img,
-                    binary=args.dataset in BINARYDATASETS,
+                    binary=args.dataset in BINARYDATASET,
                 )
 
                 cf, cf5 = accuracy(
                     data_log,
                     target,
-                    binary=args.dataset in BINARYDATASETS,
+                    binary=args.dataset in BINARYDATASET,
                 )
 
                 un, un5 = accuracy(
                     data_log,
                     c_pred,
-                    binary=args.dataset in BINARYDATASETS,
+                    binary=args.dataset in BINARYDATASET,
                 )
 
                 stats[data_type]["cf"] += cf.sum().item()
