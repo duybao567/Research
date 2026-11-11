@@ -293,7 +293,7 @@ def compute_gradcam_saliency(
     )
 
     try:
-        x = images.detach()
+        x = images.detach().clone().requires_grad_(True)
 
         with torch.enable_grad():
 
@@ -455,6 +455,8 @@ def compute_gradcam_saliency(
             info = {
                 "score_sign": sign.detach(),
                 "cam_strength": strength.detach(),
+                "cam_positive_max": pos_max.detach(),
+                "cam_absolute_max": abs_max.detach(),
                 "fallback_indices": invalid_indices.tolist(),
             }
             return saliency, info
