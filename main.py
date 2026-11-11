@@ -425,13 +425,15 @@ def main():
         adaptive_mask_config = AdaptiveMaskConfig(
             saliency_method=args.adaptive_mask_saliency_method,
             target_index=args.adaptive_mask_target_index,
+            saliency_direction=args.adaptive_mask_saliency_direction,
+
             min_coverage=args.adaptive_mask_min_coverage,
             max_coverage=args.adaptive_mask_max_coverage,
             entropy_coverage_strength=args.adaptive_mask_entropy_strength,
-            entropy_enabled=True,
-            entropy_regularization_strength=args.adaptive_mask_entropy_weight,
-            tv_enabled=True,
+
             tv_regularization_strength=args.adaptive_mask_tv_weight,
+            entropy_regularization_strength=args.adaptive_mask_entropy_weight,
+
             gaussian_smoothing_enabled=args.adaptive_mask_gaussian,
             gaussian_kernel_size=args.adaptive_mask_gaussian_kernel,
             gaussian_sigma=args.adaptive_mask_gaussian_sigma,

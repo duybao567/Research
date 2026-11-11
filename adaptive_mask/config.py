@@ -10,28 +10,30 @@ class AdaptiveMaskConfig:
     # 1. SALIENCY CONFIGURATION
     # =====================================================
 
-    # Saliency method:
-    # "gradient" = existing gradient-based saliency
-    # "gradcam"  = CAM-guided saliency (to be implemented)
+    # "gradient" = Input Gradient
+    # "gradcam"  = Grad-CAM
     saliency_method: str = "gradcam"
 
-    # Target output of the classifier.
-    # For the current CelebA-HQ Smile classifier, use 0
-    # when the saliency implementation expects an output index.
+    # Classifier output index.
+    # CelebA-HQ Smile classifier: target_index = 0
     target_index: int = 0
+
+    # Saliency direction:
+    # "predicted" = explain the classifier's current prediction
+    # "positive"  = positive classifier evidence
+    # "negative"  = negative classifier evidence
+    saliency_direction: str = "predicted"
 
     # =====================================================
     # 2. ADAPTIVE COVERAGE
     # =====================================================
 
-    # Target mask coverage.
-    # For the Smile attribute: 5% - 12%.
     min_coverage: float = 0.05
     max_coverage: float = 0.12
 
-    # Controls how saliency entropy affects mask coverage.
-    # This is different from entropy regularization below.
-    entropy_coverage_strength: float = 0.20
+    # Controls how entropy affects adaptive coverage.
+    # This is NOT entropy regularization strength.
+    entropy_coverage_strength: float = 1.0
 
     # =====================================================
     # 3. MASK GENERATION / DILATION
@@ -46,8 +48,6 @@ class AdaptiveMaskConfig:
     # =====================================================
 
     entropy_enabled: bool = True
-
-    # lambda_ent
     entropy_regularization_strength: float = 0.05
 
     # =====================================================
@@ -55,8 +55,6 @@ class AdaptiveMaskConfig:
     # =====================================================
 
     tv_enabled: bool = True
-
-    # lambda_tv
     tv_regularization_strength: float = 0.02
 
     # =====================================================
@@ -64,11 +62,7 @@ class AdaptiveMaskConfig:
     # =====================================================
 
     gaussian_smoothing_enabled: bool = True
-
-    # Gaussian kernel size must be a positive odd number.
     gaussian_kernel_size: int = 5
-
-    # Gaussian standard deviation.
     gaussian_sigma: float = 1.0
 
     # =====================================================
@@ -95,6 +89,14 @@ class AdaptiveMaskConfig:
 
         if self.target_index < 0:
             raise ValueError("target_index must be >= 0.")
+
+        if self.saliency_direction not in (
+            "predicted", "positive", "negative"
+        ):
+            raise ValueError(
+                "saliency_direction must be "
+                "'predicted', 'positive', or 'negative'."
+            )
 
         # Coverage
         if not (
