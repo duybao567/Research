@@ -331,20 +331,41 @@ def main():
     args = create_args()
 
     if args.merge_chunks:
-        merge_all_chunks(args.chunks, args.output_path, args.exp_name)
+        merge_root = osp.abspath(osp.expanduser(args.output_path))
+        if osp.basename(osp.normpath(merge_root)).lower() == 'results':
+            merge_root = osp.dirname(osp.normpath(merge_root))
+        merge_all_chunks(args.chunks, merge_root, args.exp_name)
         return
 
     respaced_steps = int(
         args.sampling_time_fraction * int(args.timestep_respacing)
     )
 
+    # ACE output_path is the ROOT directory that contains both
+    # Original/ and Results/. Accept either the root or its Results/
+    # subdirectory to prevent accidentally creating Results/Results/.
+    output_root = osp.abspath(osp.expanduser(args.output_path))
+    if osp.basename(osp.normpath(output_root)).lower() == 'results':
+        output_root = osp.dirname(osp.normpath(output_root))
+    args.output_path = output_root
+
+    results_root = osp.join(args.output_path, 'Results')
+    experiment_root = osp.join(results_root, args.exp_name)
+    original_correct_root = osp.join(args.output_path, 'Original', 'Correct')
+    original_incorrect_root = osp.join(args.output_path, 'Original', 'Incorrect')
+
     print(args)
+    print('[ACE output structure]')
+    print(f'  Output root : {args.output_path}')
+    print(f'  Original   : {osp.join(args.output_path, "Original")}')
+    print(f'  Results    : {results_root}')
+    print(f'  Experiment : {experiment_root}')
+
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    os.makedirs(osp.join(args.output_path, 'Results'), exist_ok=True)
-    os.makedirs(
-        osp.join(args.output_path, 'Results', args.exp_name),
-        exist_ok=True,
-    )
+    os.makedirs(results_root, exist_ok=True)
+    os.makedirs(experiment_root, exist_ok=True)
+    os.makedirs(original_correct_root, exist_ok=True)
+    os.makedirs(original_incorrect_root, exist_ok=True)
 
     # Set seeds.
     torch.backends.cudnn.deterministic = args.cudnn_deterministic
@@ -531,6 +552,10 @@ def main():
 
     # Output setup.
     start_time = time()
+    # Keep the official ACE ImageSaver layout:
+    # <output_root>/Original/{Correct,Incorrect}/
+    # <output_root>/Results/<exp_name>/<phase>/{CC,IC}/{CCF,ICF}/
+    #                                      {CF,Noise,Info,SM}/
     save_imgs = {
         'pre-explanation': (
             ImageSaver(
@@ -734,8 +759,10 @@ def main():
     summary_path = osp.join(
         args.output_path, 'Results', args.exp_name, prefix + 'summary.yaml'
     )
+    os.makedirs(osp.dirname(summary_path), exist_ok=True)
     with open(summary_path, 'w') as f:
         f.write(str(stats))
+    print(f'[ACE] Summary saved to: {summary_path}')
 
 
 if __name__ == '__main__':
