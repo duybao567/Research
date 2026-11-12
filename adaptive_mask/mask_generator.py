@@ -1,4 +1,3 @@
-
 """CAM-guided adaptive mask generation for ACE.
 
 This module converts a non-negative saliency map into a binary
@@ -9,7 +8,23 @@ Features:
 - Exact Top-K mask selection
 - Fixed morphological dilation (MaskDiME-inspired)
 - Adaptive-radius dilation (original M5)
+- Coverage enforced on the FINAL mask (after dilation)
 - Diagnostic information
+
+Coverage semantics (config.coverage_mode, default "final"):
+
+    "final":
+        [min_coverage, max_coverage] bounds the coverage of the final
+        mask, i.e. AFTER dilation. The top-k size is chosen per image by
+        bisection so that the dilated mask does not exceed the target
+        coverage. The final coverage can be slightly below the target
+        (a single extra top-k pixel adds up to (2r+1)^2 dilated pixels).
+
+    "raw":
+        Legacy behaviour. The coverage bounds only the top-k selection;
+        dilation then enlarges the mask, so the final coverage can be
+        several times larger than the target. This is closer to how
+        MaskDiME uses top-k followed by a 5x5 dilation.
 
 Entropy and TV mask optimization are handled separately by
 the mask refinement module.
@@ -217,8 +232,134 @@ def _compute_dilation_radius(
     )
 
 
+def _apply_dilation(
+    mask: torch.Tensor,
+    raw_coverage: float,
+    config: AdaptiveMaskConfig,
+) -> tuple[torch.Tensor, int]:
+    """Dilate a raw top-k mask according to the configured method.
+
+    Returns:
+        (dilated_mask, radius)
+    """
+
+    if config.dilation_method == "fixed":
+
+        dilated = _dilate_fixed(
+            mask,
+            kernel_size=config.dilation_kernel_size,
+        )
+
+        radius = config.dilation_kernel_size // 2
+
+    elif config.dilation_method == "adaptive":
+
+        radius = _compute_dilation_radius(
+            raw_coverage,
+            config,
+        )
+
+        dilated = _dilate(
+            mask,
+            radius,
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported dilation method: "
+            f"{config.dilation_method}"
+        )
+
+    return dilated, radius
+
+
 # =========================================================
-# 5. MAIN MASK GENERATION
+# 5. TOP-K SELECTION THAT RESPECTS FINAL COVERAGE
+# =========================================================
+
+def _fit_topk_to_final_coverage(
+    saliency: torch.Tensor,
+    target_coverage: float,
+    config: AdaptiveMaskConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Choose the largest top-k whose dilated mask fits the target.
+
+    The top-k masks are nested (k grows -> mask grows), and both fixed
+    and adaptive dilation are monotone in the mask and in k, so the
+    dilated pixel count is non-decreasing in k and bisection is valid.
+
+    Args:
+        saliency: Single-image saliency tensor [1, 1, H, W].
+        target_coverage: Maximum allowed final coverage fraction.
+        config: AdaptiveMaskConfig instance.
+
+    Returns:
+        raw_mask: Top-k mask before dilation [1, 1, H, W].
+        dilated_mask: Final mask after dilation [1, 1, H, W].
+        threshold: Lowest selected saliency value.
+        radius: Dilation radius used for the chosen k.
+    """
+
+    values = saliency.flatten()
+    num_pixels = values.numel()
+
+    order = torch.argsort(
+        values,
+        descending=True,
+        stable=True,
+    )
+
+    rank = torch.empty_like(order)
+    rank[order] = torch.arange(
+        num_pixels,
+        device=values.device,
+    )
+
+    max_final_pixels = int(
+        math.floor(target_coverage * num_pixels + 1e-4)
+    )
+    max_final_pixels = max(1, min(max_final_pixels, num_pixels))
+
+    def build(k: int):
+
+        raw = (rank < k).to(saliency.dtype).view_as(saliency)
+
+        dilated, radius = _apply_dilation(
+            raw,
+            k / num_pixels,
+            config,
+        )
+
+        return raw, dilated, radius, int(dilated.sum().item())
+
+    # Dilation never shrinks a mask, so the raw top-k can never need
+    # more pixels than the final target.
+    low = 1
+    high = max_final_pixels
+
+    if build(low)[3] > max_final_pixels:
+        k = 1
+    else:
+        while low < high:
+
+            mid = (low + high + 1) // 2
+
+            if build(mid)[3] <= max_final_pixels:
+                low = mid
+            else:
+                high = mid - 1
+
+        k = low
+
+    raw_mask, dilated_mask, radius, _ = build(k)
+
+    threshold = values[order[k - 1]]
+
+    return raw_mask, dilated_mask, threshold, radius
+
+
+# =========================================================
+# 6. MAIN MASK GENERATION
 # =========================================================
 
 def generate_adaptive_mask(
@@ -233,7 +374,10 @@ def generate_adaptive_mask(
             Non-negative saliency tensor [B, 1, H, W].
 
         config:
-            AdaptiveMaskConfig instance.
+            AdaptiveMaskConfig instance. The optional attribute
+            ``coverage_mode`` ("final" or "raw", default "final")
+            selects whether the coverage bounds apply to the final
+            dilated mask or only to the raw top-k selection.
 
         return_info:
             If True, return diagnostic information.
@@ -250,6 +394,7 @@ def generate_adaptive_mask(
                 - dilation_radius
                 - dilation_method
                 - dilation_kernel_size
+                - coverage_mode
                 - final_coverage
                 - selection_threshold
 
@@ -263,7 +408,7 @@ def generate_adaptive_mask(
     """
 
     # -----------------------------------------------------
-    # 5.1 CONFIGURATION
+    # 6.1 CONFIGURATION
     # -----------------------------------------------------
 
     if config is None:
@@ -271,8 +416,16 @@ def generate_adaptive_mask(
 
     config.validate()
 
+    coverage_mode = getattr(config, "coverage_mode", "final")
+
+    if coverage_mode not in ("final", "raw"):
+        raise ValueError(
+            "coverage_mode must be 'final' or 'raw', "
+            f"got {coverage_mode!r}."
+        )
+
     # -----------------------------------------------------
-    # 5.2 INPUT VALIDATION
+    # 6.2 INPUT VALIDATION
     # -----------------------------------------------------
 
     if not isinstance(saliency, torch.Tensor):
@@ -311,7 +464,7 @@ def generate_adaptive_mask(
     num_pixels = height * width
 
     # -----------------------------------------------------
-    # 5.3 CHECK SALIENCY QUALITY
+    # 6.3 CHECK SALIENCY QUALITY
     # -----------------------------------------------------
 
     flat_saliency = saliency.flatten(1)
@@ -338,7 +491,7 @@ def generate_adaptive_mask(
         )
 
     # -----------------------------------------------------
-    # 5.4 COMPUTE NORMALIZED ENTROPY
+    # 6.4 COMPUTE NORMALIZED ENTROPY
     # -----------------------------------------------------
 
     entropy = _normalized_entropy(
@@ -347,7 +500,7 @@ def generate_adaptive_mask(
     )
 
     # -----------------------------------------------------
-    # 5.5 ENTROPY-AWARE ADAPTIVE COVERAGE
+    # 6.5 ENTROPY-AWARE ADAPTIVE COVERAGE
     # -----------------------------------------------------
 
     if config.adaptive_coverage_enabled:
@@ -378,12 +531,14 @@ def generate_adaptive_mask(
         )
 
     # -----------------------------------------------------
-    # 5.6 EXACT TOP-K MASK GENERATION
+    # 6.6 TOP-K SELECTION AND DILATION
     # -----------------------------------------------------
 
     raw_masks = []
+    refined_masks = []
     thresholds = []
     raw_coverages = []
+    dilation_radii = []
 
     for i in range(batch_size):
 
@@ -391,65 +546,40 @@ def generate_adaptive_mask(
 
         image_coverage = float(coverage[i].item())
 
-        raw_mask, threshold = _select_topk_mask(
-            image_saliency,
-            image_coverage,
-        )
+        if coverage_mode == "final":
 
-        raw_coverage = (
-            raw_mask.sum() / num_pixels
-        ).item()
-
-        raw_masks.append(raw_mask)
-        thresholds.append(threshold)
-        raw_coverages.append(raw_coverage)
-
-    raw_masks = torch.cat(
-        raw_masks,
-        dim=0,
-    )
-
-    # -----------------------------------------------------
-    # 5.7 DILATION
-    # -----------------------------------------------------
-
-    refined_masks = []
-    dilation_radii = []
-
-    for i in range(batch_size):
-
-        raw_mask = raw_masks[i:i + 1]
-
-        if config.dilation_method == "fixed":
-
-            # Fixed morphological dilation.
-            dilated_mask = _dilate_fixed(
-                raw_mask,
-                kernel_size=config.dilation_kernel_size,
-            )
-
-            radius = config.dilation_kernel_size // 2
-
-        elif config.dilation_method == "adaptive":
-
-            # Original M5 adaptive-radius dilation.
-            radius = _compute_dilation_radius(
-                raw_coverages[i],
-                config,
-            )
-
-            dilated_mask = _dilate(
-                raw_mask,
-                radius,
+            raw_mask, dilated_mask, threshold, radius = (
+                _fit_topk_to_final_coverage(
+                    image_saliency,
+                    image_coverage,
+                    config,
+                )
             )
 
         else:
-            raise ValueError(
-                f"Unsupported dilation method: "
-                f"{config.dilation_method}"
+
+            raw_mask, threshold = _select_topk_mask(
+                image_saliency,
+                image_coverage,
             )
 
+            raw_for_radius = (
+                raw_mask.sum() / num_pixels
+            ).item()
+
+            dilated_mask, radius = _apply_dilation(
+                raw_mask,
+                raw_for_radius,
+                config,
+            )
+
+        raw_coverages.append(
+            (raw_mask.sum() / num_pixels).item()
+        )
+
+        raw_masks.append(raw_mask)
         refined_masks.append(dilated_mask)
+        thresholds.append(threshold)
         dilation_radii.append(radius)
 
     result = torch.cat(
@@ -458,13 +588,13 @@ def generate_adaptive_mask(
     ).clamp(0.0, 1.0)
 
     # -----------------------------------------------------
-    # 5.8 FINAL COVERAGE
+    # 6.7 FINAL COVERAGE
     # -----------------------------------------------------
 
     final_coverage = result.flatten(1).mean(dim=1)
 
     # -----------------------------------------------------
-    # 5.9 DIAGNOSTIC INFORMATION
+    # 6.8 DIAGNOSTIC INFORMATION
     # -----------------------------------------------------
 
     if return_info:
@@ -489,6 +619,8 @@ def generate_adaptive_mask(
                 if config.dilation_method == "fixed"
                 else None
             ),
+
+            "coverage_mode": coverage_mode,
 
             "final_coverage": final_coverage.detach(),
 

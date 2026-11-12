@@ -1,14 +1,17 @@
-
 """Configuration for M5 Adaptive Gradient Mask generation in ACE.
 
 Supports:
-- Input Gradient / Grad-CAM saliency
-- Adaptive coverage
+- Input Gradient / Grad-CAM saliency (optional SmoothGrad averaging)
+- Adaptive coverage (entropy-aware)
+- Coverage accounting: "final" (cap AFTER dilation) or "raw" (cap on top-k only)
 - Multi-region Top-K
 - Fixed 5x5 morphological dilation (MaskDiME-inspired)
 - Entropy and TV regularization
 - Adaptive Gaussian smoothing
 - Optional mask refinement
+
+Field order note: fields added in this revision (section 9) are appended
+after the original ones, so existing positional construction still works.
 """
 
 from dataclasses import dataclass
@@ -116,10 +119,39 @@ class AdaptiveMaskConfig:
     eps: float = 1e-8
 
     # =====================================================
-    # 10. VALIDATION
+    # 10. COVERAGE MODE  (added)
     # =====================================================
 
-    def validate(self):
+    # "final": min/max_coverage bound the mask AFTER dilation (the mask
+    #          ACE actually uses). Top-k is shrunk by bisection until the
+    #          dilated mask fits.
+    # "raw"  : bounds apply to the top-k mask only, dilation then inflates
+    #          it (old behaviour; ~3x larger in practice, like MaskDiME's
+    #          top-k + 5x5 dilation).
+    coverage_mode: str = "final"
+
+    # =====================================================
+    # 11. SALIENCY NOISE REDUCTION / CAM  (added)
+    # =====================================================
+
+    # SmoothGrad: average the gradient saliency over this many noisy
+    # copies of the input. 1 = off (plain gradient).
+    smoothgrad_samples: int = 1
+
+    # Noise std as a fraction of each image's (max - min).
+    smoothgrad_noise: float = 0.1
+
+    # Seed of the private generator used for the SmoothGrad noise.
+    smoothgrad_seed: int = 0
+
+    # Grad-CAM only: minimum CAM strength (relative) to accept a map.
+    min_cam_strength: float = 0.05
+
+    # =====================================================
+    # 12. VALIDATION
+    # =====================================================
+
+    def validate(self) -> "AdaptiveMaskConfig":
 
         # Saliency
         if self.saliency_method not in ("gradient", "gradcam"):
@@ -156,6 +188,11 @@ class AdaptiveMaskConfig:
         if not (0.0 <= self.entropy_coverage_strength <= 1.0):
             raise ValueError(
                 "entropy_coverage_strength must be in [0, 1]."
+            )
+
+        if self.coverage_mode not in ("final", "raw"):
+            raise ValueError(
+                "coverage_mode must be 'final' or 'raw'."
             )
 
         # Multi-region
@@ -269,6 +306,22 @@ class AdaptiveMaskConfig:
         if self.min_component_area < 1:
             raise ValueError(
                 "min_component_area must be >= 1."
+            )
+
+        # SmoothGrad / CAM
+        if self.smoothgrad_samples < 1:
+            raise ValueError(
+                "smoothgrad_samples must be >= 1."
+            )
+
+        if self.smoothgrad_noise < 0:
+            raise ValueError(
+                "smoothgrad_noise must be >= 0."
+            )
+
+        if not (0.0 <= self.min_cam_strength <= 1.0):
+            raise ValueError(
+                "min_cam_strength must be in [0, 1]."
             )
 
         # Numerical stability

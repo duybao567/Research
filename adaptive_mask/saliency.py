@@ -1,7 +1,7 @@
 """Gradient-based and Grad-CAM saliency estimation for ACE.
 
 Supported methods:
-    - Input Gradient
+    - Input Gradient (optionally SmoothGrad-averaged)
     - Grad-CAM
 
 Expected input:
@@ -12,20 +12,31 @@ Expected input:
 The classifier_fn should apply exactly the same preprocessing
 as the original classifier, and the classifier must be in eval().
 
-Key design points (fixes over the previous version):
+Key design points:
     1. Direction-aware scores for single-output classifiers.
        A single logit z means "attribute present" when z > 0 and
        "attribute absent" when z < 0. Explaining +z for a negative
        prediction gives a CAM whose evidence is all negative, which
-       ReLU wipes out, leaving only border noise. By default we now
+       ReLU wipes out, leaving only border noise. By default we
        explain the PREDICTED side: score = sign(z) * z.
+       Note: for the input-gradient method with absolute=True the
+       direction has no effect, because |grad(-z)| == |grad(z)|.
     2. CAM validity is judged on the raw (pre-ReLU) CAM, relative to
        its own magnitude, not with an absolute eps. A CAM whose positive
        part is tiny compared with its negative part is degenerate and
        triggers the fallback instead of being stretched to [0, 1].
     3. Max-normalization (no min subtraction) so that background is not
-       lifted, and the target-layer output is cloned inside the hook so
-       downstream in-place ops (ReLU(inplace=True)) cannot corrupt it.
+       lifted.
+    4. Optional SmoothGrad for the input-gradient method.
+       Raw input gradients of a CNN classifier are noisy and scattered.
+       A top-k selection on such a map yields isolated pixels, which a
+       later dilation inflates into a much larger mask. Averaging the
+       gradient over several noisy copies of the image gives a smoother
+       map, so the selected pixels cluster more. Disabled by default
+       (smoothgrad_samples = 1 reproduces the plain input gradient).
+       The noise comes from a private generator, so enabling SmoothGrad
+       does not change the global random stream used by the diffusion
+       sampler.
 """
 
 import torch
@@ -165,7 +176,7 @@ def _normalize_saliency(
 
 
 # =========================================================
-# 2. INPUT GRADIENT SALIENCY
+# 2. INPUT GRADIENT SALIENCY (OPTIONAL SMOOTHGRAD)
 # =========================================================
 
 def compute_gradient_saliency(
@@ -176,8 +187,21 @@ def compute_gradient_saliency(
     normalize: bool = True,
     eps: float = 1e-8,
     direction: str = "predicted",
+    smoothgrad_samples: int = 1,
+    smoothgrad_noise: float = 0.1,
+    smoothgrad_seed: int = 0,
 ) -> torch.Tensor:
     """Compute input-gradient saliency.
+
+    Args:
+        smoothgrad_samples:
+            Number of noisy copies to average. 1 means the plain
+            gradient of the clean image (previous behaviour).
+        smoothgrad_noise:
+            Noise standard deviation as a fraction of each image's
+            value range (max - min). Ignored when smoothgrad_samples=1.
+        smoothgrad_seed:
+            Seed of the private noise generator.
 
     Returns:
         Saliency maps [B,1,H,W] in [0,1] if normalize=True.
@@ -185,36 +209,99 @@ def compute_gradient_saliency(
 
     _validate_images(images)
 
-    x = images.detach().clone().requires_grad_(True)
+    if smoothgrad_samples < 1:
+        raise ValueError("smoothgrad_samples must be >= 1.")
 
-    with torch.enable_grad():
+    if smoothgrad_noise < 0:
+        raise ValueError("smoothgrad_noise must be >= 0.")
 
-        logits = classifier_fn(x)
+    base = images.detach()
 
-        scores, _ = _directional_scores(
-            logits,
-            target_index,
-            x.shape[0],
-            direction,
+    use_smoothing = (
+        smoothgrad_samples > 1 and smoothgrad_noise > 0
+    )
+
+    generator = None
+    noise_std = None
+    in_unit_range = False
+
+    if use_smoothing:
+
+        generator = torch.Generator(device=base.device)
+        generator.manual_seed(int(smoothgrad_seed))
+
+        spread = (
+            base.amax(dim=(1, 2, 3), keepdim=True)
+            - base.amin(dim=(1, 2, 3), keepdim=True)
+        ).clamp_min(eps)
+
+        noise_std = smoothgrad_noise * spread
+
+        in_unit_range = bool(
+            base.min() >= 0.0 and base.max() <= 1.0
         )
 
-        gradient = torch.autograd.grad(
-            scores.sum(),
-            x,
-            retain_graph=False,
-            create_graph=False,
-        )[0]
+    total = None
 
-    if absolute:
-        saliency = gradient.abs().mean(
-            dim=1,
-            keepdim=True,
+    for _ in range(smoothgrad_samples if use_smoothing else 1):
+
+        if use_smoothing:
+
+            noise = torch.randn(
+                base.shape,
+                generator=generator,
+                device=base.device,
+                dtype=base.dtype,
+            )
+
+            x = base + noise * noise_std
+
+            if in_unit_range:
+                x = x.clamp(0.0, 1.0)
+
+        else:
+            x = base.clone()
+
+        x = x.requires_grad_(True)
+
+        with torch.enable_grad():
+
+            logits = classifier_fn(x)
+
+            scores, _ = _directional_scores(
+                logits,
+                target_index,
+                x.shape[0],
+                direction,
+            )
+
+            gradient = torch.autograd.grad(
+                scores.sum(),
+                x,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+
+        if absolute:
+            sample_saliency = gradient.abs().mean(
+                dim=1,
+                keepdim=True,
+            )
+        else:
+            sample_saliency = gradient.mean(
+                dim=1,
+                keepdim=True,
+            ).relu()
+
+        total = (
+            sample_saliency
+            if total is None
+            else total + sample_saliency
         )
-    else:
-        saliency = gradient.mean(
-            dim=1,
-            keepdim=True,
-        ).relu()
+
+    saliency = total / (
+        smoothgrad_samples if use_smoothing else 1
+    )
 
     if normalize:
         saliency = _normalize_saliency(
@@ -281,9 +368,12 @@ def compute_gradcam_saliency(
                 f"got {tuple(output.shape)}."
             )
 
-        # Clone so later in-place ops (e.g. ReLU(inplace=True)) cannot
-        # modify the tensor we differentiate against. Returning the
-        # clone keeps it in the graph.
+        # The same tensor is stored and returned to the network. The
+        # clone keeps a following in-place op from overwriting the
+        # layer's own output. When such an op follows the layer
+        # (torchvision DenseNet: norm5 -> ReLU(inplace=True)), the
+        # stored activation is therefore expected to be the post-ReLU
+        # feature map, the usual Grad-CAM feature map for DenseNet.
         output = output.clone()
         activations.append(output)
         return output
@@ -298,6 +388,11 @@ def compute_gradcam_saliency(
         with torch.enable_grad():
 
             logits = classifier_fn(x)
+
+            # The hook is only needed for this single forward pass.
+            # Removing it now keeps the fallback below from running
+            # the hook again.
+            handle.remove()
 
             if len(activations) != 1:
                 raise RuntimeError(
@@ -486,6 +581,9 @@ def compute_saliency(
     Optional config attributes (defaults used if absent):
         - saliency_direction: "predicted" | "positive" | "negative"
         - min_cam_strength: float, default 0.05
+        - smoothgrad_samples: int, default 1 (SmoothGrad off)
+        - smoothgrad_noise: float, default 0.1 (fraction of value range)
+        - smoothgrad_seed: int, default 0
     """
 
     config.validate()
@@ -502,6 +600,9 @@ def compute_saliency(
             target_index=config.target_index,
             eps=config.eps,
             direction=direction,
+            smoothgrad_samples=getattr(config, "smoothgrad_samples", 1),
+            smoothgrad_noise=getattr(config, "smoothgrad_noise", 0.1),
+            smoothgrad_seed=getattr(config, "smoothgrad_seed", 0),
         )
 
     if method == "gradcam":

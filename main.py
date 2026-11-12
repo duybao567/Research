@@ -176,6 +176,19 @@ def create_args():
         adaptive_mask_gaussian_kernel=5,
         adaptive_mask_gaussian_sigma=1.0,
 
+        # "final": coverage bounds apply AFTER dilation (the mask ACE uses)
+        # "raw"  : bounds apply to top-k only; dilation then inflates it
+        adaptive_mask_coverage_mode="final",
+
+        # "fixed" (k x k dilation, MaskDiME-like) or "adaptive"
+        adaptive_mask_dilation_method="fixed",
+        adaptive_mask_dilation_kernel=5,
+
+        # SmoothGrad (1 = plain gradient). Gradient saliency only.
+        adaptive_mask_smoothgrad_samples=1,
+        adaptive_mask_smoothgrad_noise=0.1,
+        adaptive_mask_smoothgrad_seed=0,
+
         adaptive_mask_save_visualizations=True,
         adaptive_mask_debug_only=False,
 
@@ -363,6 +376,31 @@ def filter_fn(
             adaptive_edit_mask.mean(
                 dim=(1, 2, 3)
             ).detach().cpu().tolist(),
+        )
+
+        # Extra diagnostics: raw (pre-dilation) coverage, dilation radius,
+        # and how much of the PGD perturbation survives inside the mask.
+        # pe is computed on the whole image, so perturbation outside the
+        # mask is replaced by the original pixels and is lost.
+        with torch.no_grad():
+            pe_delta = (pe.detach() - x.detach()).abs().mean(
+                dim=1, keepdim=True
+            )
+            inside_energy = (
+                (pe_delta * adaptive_edit_mask).sum(dim=(1, 2, 3))
+                / pe_delta.sum(dim=(1, 2, 3)).clamp_min(1e-12)
+            )
+
+        raw_cov = mask_info.get("raw_coverage")
+
+        print(
+            "[M5] raw coverage:",
+            raw_cov.cpu().tolist()
+            if torch.is_tensor(raw_cov) else raw_cov,
+            "| dilation radius:",
+            mask_info.get("dilation_radius"),
+            "| PGD energy inside mask:",
+            [round(v, 3) for v in inside_energy.cpu().tolist()],
         )
 
         if adaptive_mask_debug_only:
@@ -675,6 +713,15 @@ def main():
             gaussian_smoothing_enabled=args.adaptive_mask_gaussian,
             gaussian_kernel_size=args.adaptive_mask_gaussian_kernel,
             gaussian_sigma=args.adaptive_mask_gaussian_sigma,
+
+            coverage_mode=args.adaptive_mask_coverage_mode,
+
+            dilation_method=args.adaptive_mask_dilation_method,
+            dilation_kernel_size=args.adaptive_mask_dilation_kernel,
+
+            smoothgrad_samples=args.adaptive_mask_smoothgrad_samples,
+            smoothgrad_noise=args.adaptive_mask_smoothgrad_noise,
+            smoothgrad_seed=args.adaptive_mask_smoothgrad_seed,
         ).validate()
 
         if adaptive_mask_config.saliency_method == "gradcam":
@@ -708,6 +755,18 @@ def main():
             (
                 args.adaptive_mask_min_coverage,
                 args.adaptive_mask_max_coverage,
+            ),
+            "| coverage mode:", args.adaptive_mask_coverage_mode,
+            "| dilation:",
+            (
+                args.adaptive_mask_dilation_method,
+                args.adaptive_mask_dilation_kernel,
+            ),
+            "| SmoothGrad:",
+            (
+                args.adaptive_mask_smoothgrad_samples,
+                args.adaptive_mask_smoothgrad_noise,
+                args.adaptive_mask_smoothgrad_seed,
             ),
         )
 
