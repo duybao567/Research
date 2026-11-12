@@ -2,11 +2,22 @@
 """CAM-guided adaptive mask generation for ACE.
 
 This module converts a non-negative saliency map into a binary
-adaptive mask. It supports per-image entropy-aware coverage,
-exact top-k selection, and adaptive morphological dilation.
+adaptive mask.
+
+Features:
+- Per-image entropy-aware coverage
+- Exact Top-K mask selection
+- Fixed morphological dilation (MaskDiME-inspired)
+- Adaptive-radius dilation (original M5)
+- Diagnostic information
 
 Entropy and TV mask optimization are handled separately by
 the mask refinement module.
+
+Note:
+Fixed 5x5 dilation is inspired by the dilation kernel described
+in MaskDiME. This module does not implement the complete
+dynamic dual-mask sampling procedure of MaskDiME.
 """
 
 import math
@@ -16,6 +27,10 @@ import torch.nn.functional as F
 
 from .config import AdaptiveMaskConfig
 
+
+# =========================================================
+# 1. NORMALIZED ENTROPY
+# =========================================================
 
 def _normalized_entropy(
     saliency: torch.Tensor,
@@ -28,8 +43,9 @@ def _normalized_entropy(
         eps: Numerical stability constant.
 
     Returns:
-        Entropy tensor [B], normalized approximately to [0, 1].
+        Entropy tensor [B], approximately in [0, 1].
     """
+
     probabilities = saliency.flatten(1)
 
     probabilities = probabilities / probabilities.sum(
@@ -48,15 +64,15 @@ def _normalized_entropy(
     return (entropy / max_entropy).clamp(0.0, 1.0)
 
 
+# =========================================================
+# 2. EXACT TOP-K MASK GENERATION
+# =========================================================
+
 def _select_topk_mask(
     saliency: torch.Tensor,
     coverage: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select exactly the top-k saliency pixels.
-
-    Unlike threshold-based selection, this function guarantees
-    that the initial binary mask contains exactly k selected pixels,
-    even when multiple saliency values are tied.
 
     Args:
         saliency: Single-image saliency tensor [1, 1, H, W].
@@ -66,6 +82,7 @@ def _select_topk_mask(
         mask: Binary mask [1, 1, H, W].
         threshold: Lowest selected saliency value.
     """
+
     values = saliency.flatten()
 
     num_pixels = values.numel()
@@ -95,41 +112,87 @@ def _select_topk_mask(
     return mask, threshold
 
 
+# =========================================================
+# 3. FIXED MORPHOLOGICAL DILATION
+# =========================================================
+
+def _dilate_fixed(
+    mask: torch.Tensor,
+    kernel_size: int = 5,
+) -> torch.Tensor:
+    """Apply fixed-size binary morphological dilation.
+
+    Uses max pooling with a square structuring element.
+
+    Args:
+        mask: Binary mask [B, 1, H, W].
+        kernel_size: Odd kernel size, e.g. 5.
+
+    Returns:
+        Binary dilated mask with the same shape.
+    """
+
+    if kernel_size < 1 or kernel_size % 2 == 0:
+        raise ValueError(
+            "kernel_size must be a positive odd number."
+        )
+
+    mask_float = (mask > 0).float()
+
+    radius = kernel_size // 2
+
+    dilated = F.max_pool2d(
+        mask_float,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=radius,
+    )
+
+    return (dilated > 0).to(mask.dtype)
+
+
+# =========================================================
+# 4. ADAPTIVE-RADIUS DILATION (ORIGINAL M5)
+# =========================================================
+
 def _dilate(
     mask: torch.Tensor,
     radius: int,
 ) -> torch.Tensor:
-    """Apply morphological dilation using max pooling.
+    """Apply adaptive-radius dilation using max pooling.
 
     Args:
         mask: Binary mask [B, 1, H, W].
         radius: Dilation radius in pixels.
 
     Returns:
-        Dilated binary mask with the same shape.
+        Binary dilated mask with the same shape.
     """
-    if radius <= 0:
-        return mask
+
+    if radius < 0:
+        raise ValueError("radius must be >= 0.")
+
+    if radius == 0:
+        return (mask > 0).to(mask.dtype)
 
     kernel_size = 2 * radius + 1
 
-    return F.max_pool2d(
-        mask,
+    dilated = F.max_pool2d(
+        (mask > 0).float(),
         kernel_size=kernel_size,
         stride=1,
         padding=radius,
     )
+
+    return (dilated > 0).to(mask.dtype)
 
 
 def _compute_dilation_radius(
     raw_coverage: float,
     config: AdaptiveMaskConfig,
 ) -> int:
-    """Compute adaptive dilation radius from raw mask coverage.
+    """Compute adaptive dilation radius from raw mask coverage."""
 
-    Larger initial masks receive a larger dilation radius,
-    according to the configured reference area.
-    """
     min_radius = config.min_dilation_radius
     max_radius = config.max_dilation_radius
 
@@ -154,6 +217,10 @@ def _compute_dilation_radius(
     )
 
 
+# =========================================================
+# 5. MAIN MASK GENERATION
+# =========================================================
+
 def generate_adaptive_mask(
     saliency: torch.Tensor,
     config: AdaptiveMaskConfig = None,
@@ -164,13 +231,12 @@ def generate_adaptive_mask(
     Args:
         saliency:
             Non-negative saliency tensor [B, 1, H, W].
-            This can be generated by gradient saliency or Grad-CAM.
 
         config:
             AdaptiveMaskConfig instance.
 
         return_info:
-            If True, also return diagnostic information.
+            If True, return diagnostic information.
 
     Returns:
         If return_info=False:
@@ -182,20 +248,22 @@ def generate_adaptive_mask(
                 - target_coverage
                 - raw_coverage
                 - dilation_radius
+                - dilation_method
+                - dilation_kernel_size
                 - final_coverage
                 - selection_threshold
 
-    Note:
-        The returned mask uses 1 for selected saliency regions
-        and 0 for unselected regions.
+    Mask convention:
+        1 = selected saliency region
+        0 = unselected region
 
-        This module does not assume whether ACE interprets 1 as
-        an inpainting region or a preserved region. Verify the
-        sampler's mask convention before integration.
+    This module does not determine whether ACE interprets
+    mask value 1 as an inpainting or preserved region.
+    Verify the sampler's mask convention before integration.
     """
 
     # -----------------------------------------------------
-    # 1. CONFIGURATION
+    # 5.1 CONFIGURATION
     # -----------------------------------------------------
 
     if config is None:
@@ -204,7 +272,7 @@ def generate_adaptive_mask(
     config.validate()
 
     # -----------------------------------------------------
-    # 2. INPUT VALIDATION
+    # 5.2 INPUT VALIDATION
     # -----------------------------------------------------
 
     if not isinstance(saliency, torch.Tensor):
@@ -221,17 +289,21 @@ def generate_adaptive_mask(
         )
 
     if saliency.shape[0] < 1:
-        raise ValueError("saliency batch must not be empty.")
+        raise ValueError(
+            "saliency batch must not be empty."
+        )
 
     if saliency.shape[2] < 1 or saliency.shape[3] < 1:
-        raise ValueError("saliency spatial dimensions must be positive.")
+        raise ValueError(
+            "saliency spatial dimensions must be positive."
+        )
 
     if not torch.isfinite(saliency).all():
         raise ValueError(
             "saliency contains NaN or Inf values."
         )
 
-    # Saliency should be non-negative.
+    # Saliency must be non-negative.
     saliency = saliency.detach().clamp_min(0.0)
 
     batch_size, _, height, width = saliency.shape
@@ -239,7 +311,7 @@ def generate_adaptive_mask(
     num_pixels = height * width
 
     # -----------------------------------------------------
-    # 3. CHECK SALIENCY QUALITY
+    # 5.3 CHECK SALIENCY QUALITY
     # -----------------------------------------------------
 
     flat_saliency = saliency.flatten(1)
@@ -262,11 +334,11 @@ def generate_adaptive_mask(
         raise ValueError(
             "Invalid or spatially constant saliency map "
             f"for batch indices {invalid_indices}. "
-            "Check the classifier gradients or Grad-CAM target layer."
+            "Check classifier gradients or Grad-CAM target layer."
         )
 
     # -----------------------------------------------------
-    # 4. COMPUTE NORMALIZED ENTROPY
+    # 5.4 COMPUTE NORMALIZED ENTROPY
     # -----------------------------------------------------
 
     entropy = _normalized_entropy(
@@ -275,37 +347,38 @@ def generate_adaptive_mask(
     )
 
     # -----------------------------------------------------
-    # 5. ENTROPY-AWARE ADAPTIVE COVERAGE
+    # 5.5 ENTROPY-AWARE ADAPTIVE COVERAGE
     # -----------------------------------------------------
 
-    # entropy_coverage_strength controls how strongly entropy
-    # changes the coverage within [min_coverage, max_coverage].
-    #
-    # strength = 0:
-    #     Always use min_coverage.
-    #
-    # strength = 1:
-    #     Map normalized entropy across the full coverage range.
+    if config.adaptive_coverage_enabled:
 
-    entropy_factor = (
-        config.entropy_coverage_strength * entropy
-    ).clamp(0.0, 1.0)
+        entropy_factor = (
+            config.entropy_coverage_strength * entropy
+        ).clamp(0.0, 1.0)
 
-    coverage = (
-        config.min_coverage
-        + (
-            config.max_coverage
-            - config.min_coverage
-        ) * entropy_factor
-    )
+        coverage = (
+            config.min_coverage
+            + (
+                config.max_coverage
+                - config.min_coverage
+            ) * entropy_factor
+        )
 
-    coverage = coverage.clamp(
-        config.min_coverage,
-        config.max_coverage,
-    )
+        coverage = coverage.clamp(
+            config.min_coverage,
+            config.max_coverage,
+        )
+
+    else:
+
+        # Fixed coverage when adaptive coverage is disabled.
+        coverage = torch.full_like(
+            entropy,
+            config.min_coverage,
+        )
 
     # -----------------------------------------------------
-    # 6. EXACT TOP-K MASK GENERATION
+    # 5.6 EXACT TOP-K MASK GENERATION
     # -----------------------------------------------------
 
     raw_masks = []
@@ -324,8 +397,7 @@ def generate_adaptive_mask(
         )
 
         raw_coverage = (
-            raw_mask.sum()
-            / num_pixels
+            raw_mask.sum() / num_pixels
         ).item()
 
         raw_masks.append(raw_mask)
@@ -338,7 +410,7 @@ def generate_adaptive_mask(
     )
 
     # -----------------------------------------------------
-    # 7. ADAPTIVE DILATION
+    # 5.7 DILATION
     # -----------------------------------------------------
 
     refined_masks = []
@@ -348,15 +420,34 @@ def generate_adaptive_mask(
 
         raw_mask = raw_masks[i:i + 1]
 
-        radius = _compute_dilation_radius(
-            raw_coverages[i],
-            config,
-        )
+        if config.dilation_method == "fixed":
 
-        dilated_mask = _dilate(
-            raw_mask,
-            radius,
-        )
+            # Fixed morphological dilation.
+            dilated_mask = _dilate_fixed(
+                raw_mask,
+                kernel_size=config.dilation_kernel_size,
+            )
+
+            radius = config.dilation_kernel_size // 2
+
+        elif config.dilation_method == "adaptive":
+
+            # Original M5 adaptive-radius dilation.
+            radius = _compute_dilation_radius(
+                raw_coverages[i],
+                config,
+            )
+
+            dilated_mask = _dilate(
+                raw_mask,
+                radius,
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported dilation method: "
+                f"{config.dilation_method}"
+            )
 
         refined_masks.append(dilated_mask)
         dilation_radii.append(radius)
@@ -367,13 +458,13 @@ def generate_adaptive_mask(
     ).clamp(0.0, 1.0)
 
     # -----------------------------------------------------
-    # 8. FINAL COVERAGE
+    # 5.8 FINAL COVERAGE
     # -----------------------------------------------------
 
     final_coverage = result.flatten(1).mean(dim=1)
 
     # -----------------------------------------------------
-    # 9. DIAGNOSTIC INFORMATION
+    # 5.9 DIAGNOSTIC INFORMATION
     # -----------------------------------------------------
 
     if return_info:
@@ -390,6 +481,14 @@ def generate_adaptive_mask(
             ),
 
             "dilation_radius": dilation_radii,
+
+            "dilation_method": config.dilation_method,
+
+            "dilation_kernel_size": (
+                config.dilation_kernel_size
+                if config.dilation_method == "fixed"
+                else None
+            ),
 
             "final_coverage": final_coverage.detach(),
 

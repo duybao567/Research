@@ -1,85 +1,125 @@
 
-"""Configuration for M5 Adaptive Mask generation in ACE."""
+"""Configuration for M5 Adaptive Gradient Mask generation in ACE.
+
+Supports:
+- Input Gradient / Grad-CAM saliency
+- Adaptive coverage
+- Multi-region Top-K
+- Fixed 5x5 morphological dilation (MaskDiME-inspired)
+- Entropy and TV regularization
+- Adaptive Gaussian smoothing
+- Optional mask refinement
+"""
 
 from dataclasses import dataclass
 
 
 @dataclass
 class AdaptiveMaskConfig:
+
     # =====================================================
     # 1. SALIENCY CONFIGURATION
     # =====================================================
 
-    # "gradient" = Input Gradient
-    # "gradcam"  = Grad-CAM
-    saliency_method: str = "gradcam"
+    saliency_method: str = "gradient"
 
-    # Classifier output index.
-    # CelebA-HQ Smile classifier: target_index = 0
     target_index: int = 0
 
-    # Saliency direction:
-    # "predicted" = explain the classifier's current prediction
-    # "positive"  = positive classifier evidence
-    # "negative"  = negative classifier evidence
     saliency_direction: str = "predicted"
 
     # =====================================================
     # 2. ADAPTIVE COVERAGE
     # =====================================================
 
+    adaptive_coverage_enabled: bool = True
+
     min_coverage: float = 0.05
     max_coverage: float = 0.12
 
-    # Controls how entropy affects adaptive coverage.
-    # This is NOT entropy regularization strength.
+    saliency_mass_ratio: float = 0.80
+
     entropy_coverage_strength: float = 1.0
 
     # =====================================================
-    # 3. MASK GENERATION / DILATION
+    # 3. MULTI-REGION TOP-K
     # =====================================================
+
+    multi_region_enabled: bool = False
+
+    multi_region_grid_size: int = 4
+
+    multi_region_min_regions: int = 2
+    multi_region_max_regions: int = 8
+
+    multi_region_topk_ratio: float = 0.10
+
+    # =====================================================
+    # 4. MASK GENERATION / DILATION
+    # =====================================================
+
+    # "fixed"    = Fixed morphological dilation
+    # "adaptive" = Adaptive radius dilation
+    dilation_method: str = "fixed"
+
+    # MaskDiME-inspired fixed kernel size
+    dilation_kernel_size: int = 5
+
+    # Retained for optional adaptive dilation experiments
+    adaptive_dilation_enabled: bool = False
 
     min_dilation_radius: int = 1
     max_dilation_radius: int = 9
+
     dilation_area_reference: float = 0.15
 
     # =====================================================
-    # 4. ENTROPY REGULARIZATION
+    # 5. ENTROPY REGULARIZATION
     # =====================================================
 
     entropy_enabled: bool = True
     entropy_regularization_strength: float = 0.05
 
     # =====================================================
-    # 5. TOTAL VARIATION REGULARIZATION
+    # 6. TOTAL VARIATION REGULARIZATION
     # =====================================================
 
     tv_enabled: bool = True
     tv_regularization_strength: float = 0.02
 
     # =====================================================
-    # 6. GAUSSIAN MASK SMOOTHING
+    # 7. GAUSSIAN MASK SMOOTHING
     # =====================================================
 
     gaussian_smoothing_enabled: bool = True
+
     gaussian_kernel_size: int = 5
     gaussian_sigma: float = 1.0
 
+    adaptive_gaussian_enabled: bool = False
+
+    gaussian_min_sigma: float = 0.5
+    gaussian_max_sigma: float = 1.2
+
     # =====================================================
-    # 7. MASK REFINEMENT
+    # 8. MASK REFINEMENT
     # =====================================================
+
+    mask_refinement_enabled: bool = False
 
     closing_kernel_size: int = 5
     min_component_area: int = 16
 
     # =====================================================
-    # 8. NUMERICAL STABILITY
+    # 9. NUMERICAL STABILITY
     # =====================================================
 
     eps: float = 1e-8
 
+    # =====================================================
+    # 10. VALIDATION
+    # =====================================================
+
     def validate(self):
-        """Validate all adaptive mask configuration values."""
 
         # Saliency
         if self.saliency_method not in ("gradient", "gradcam"):
@@ -108,12 +148,60 @@ class AdaptiveMaskConfig:
                 "Require 0 < min_coverage <= max_coverage < 1."
             )
 
+        if not (0.0 < self.saliency_mass_ratio <= 1.0):
+            raise ValueError(
+                "saliency_mass_ratio must be in (0, 1]."
+            )
+
         if not (0.0 <= self.entropy_coverage_strength <= 1.0):
             raise ValueError(
                 "entropy_coverage_strength must be in [0, 1]."
             )
 
+        # Multi-region
+        if self.multi_region_grid_size < 1:
+            raise ValueError(
+                "multi_region_grid_size must be >= 1."
+            )
+
+        if self.multi_region_min_regions < 1:
+            raise ValueError(
+                "multi_region_min_regions must be >= 1."
+            )
+
+        if self.multi_region_max_regions < self.multi_region_min_regions:
+            raise ValueError(
+                "multi_region_max_regions must be >= "
+                "multi_region_min_regions."
+            )
+
+        if self.multi_region_max_regions > self.multi_region_grid_size ** 2:
+            raise ValueError(
+                "multi_region_max_regions cannot exceed "
+                "grid_size squared."
+            )
+
+        if not (0.0 < self.multi_region_topk_ratio <= 1.0):
+            raise ValueError(
+                "multi_region_topk_ratio must be in (0, 1]."
+            )
+
         # Dilation
+        if self.dilation_method not in ("fixed", "adaptive"):
+            raise ValueError(
+                "dilation_method must be 'fixed' or 'adaptive'."
+            )
+
+        if self.dilation_kernel_size < 1:
+            raise ValueError(
+                "dilation_kernel_size must be >= 1."
+            )
+
+        if self.dilation_kernel_size % 2 == 0:
+            raise ValueError(
+                "dilation_kernel_size must be odd."
+            )
+
         if self.min_dilation_radius < 0:
             raise ValueError(
                 "min_dilation_radius must be >= 0."
@@ -129,19 +217,19 @@ class AdaptiveMaskConfig:
                 "dilation_area_reference must be in (0, 1)."
             )
 
-        # Entropy regularization
+        # Entropy
         if self.entropy_regularization_strength < 0:
             raise ValueError(
                 "entropy_regularization_strength must be >= 0."
             )
 
-        # TV regularization
+        # TV
         if self.tv_regularization_strength < 0:
             raise ValueError(
                 "tv_regularization_strength must be >= 0."
             )
 
-        # Gaussian smoothing
+        # Gaussian
         if self.gaussian_kernel_size < 1:
             raise ValueError(
                 "gaussian_kernel_size must be >= 1."
@@ -149,7 +237,7 @@ class AdaptiveMaskConfig:
 
         if self.gaussian_kernel_size % 2 == 0:
             raise ValueError(
-                "gaussian_kernel_size must be an odd number."
+                "gaussian_kernel_size must be odd."
             )
 
         if self.gaussian_sigma <= 0:
@@ -157,10 +245,25 @@ class AdaptiveMaskConfig:
                 "gaussian_sigma must be > 0."
             )
 
-        # Mask refinement
+        if self.gaussian_min_sigma <= 0:
+            raise ValueError(
+                "gaussian_min_sigma must be > 0."
+            )
+
+        if self.gaussian_max_sigma < self.gaussian_min_sigma:
+            raise ValueError(
+                "gaussian_max_sigma must be >= gaussian_min_sigma."
+            )
+
+        # Refinement
         if self.closing_kernel_size < 1:
             raise ValueError(
                 "closing_kernel_size must be >= 1."
+            )
+
+        if self.closing_kernel_size % 2 == 0:
+            raise ValueError(
+                "closing_kernel_size must be odd."
             )
 
         if self.min_component_area < 1:
