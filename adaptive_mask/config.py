@@ -14,7 +14,17 @@ Field order note: fields added in this revision (section 9) are appended
 after the original ones, so existing positional construction still works.
 """
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
+
+
+def _env_str(name: str, default: str):
+    return os.environ.get(name, default)
+
+
+def _env_float(name: str, default: float):
+    value = os.environ.get(name)
+    return float(value) if value not in (None, "") else default
 
 
 @dataclass
@@ -148,7 +158,46 @@ class AdaptiveMaskConfig:
     min_cam_strength: float = 0.05
 
     # =====================================================
-    # 12. VALIDATION
+    # 12. COVERAGE RULE / SALIENCY SMOOTHING  (added, M5-v2)
+    # =====================================================
+
+    # How the per-image coverage inside [min_coverage, max_coverage]
+    # is chosen:
+    #   "entropy": legacy rule. coverage = min + (max - min) *
+    #              entropy_coverage_strength * normalized_entropy.
+    #              With raw input gradients the entropy is ~0.9 for every
+    #              image, so this rule barely adapts (and with
+    #              entropy_coverage_strength = 0.02 it pins every image to
+    #              ~min_coverage).
+    #   "mass":    smallest top-k region that holds `saliency_mass_ratio`
+    #              of the (smoothed) saliency mass, clamped to
+    #              [min_coverage, max_coverage]. Images whose evidence is
+    #              concentrated get small masks, spread-out evidence gets
+    #              larger masks.
+    #   "fixed":   every image uses max_coverage (MaskDiME-style fixed k).
+    # Default comes from the environment variable M5_COVERAGE_RULE so it
+    # can be switched from a job script without touching main.py.
+    coverage_rule: str = field(
+        default_factory=lambda: _env_str("M5_COVERAGE_RULE", "entropy")
+    )
+
+    # Gaussian sigma (pixels) applied to the saliency map BEFORE top-k.
+    # Raw input gradients are scattered pixels; top-k on them gives
+    # isolated dots that dilation inflates into many small blobs.
+    # Smoothing first makes the selected region compact (e.g. the mouth).
+    # 0 = off (legacy). Env override: M5_SALIENCY_SIGMA.
+    mask_saliency_sigma: float = field(
+        default_factory=lambda: _env_float("M5_SALIENCY_SIGMA", 0.0)
+    )
+
+    def __post_init__(self):
+        # Allow the mass ratio to be overridden from the job script too.
+        override = os.environ.get("M5_MASS_RATIO")
+        if override not in (None, ""):
+            self.saliency_mass_ratio = float(override)
+
+    # =====================================================
+    # 13. VALIDATION
     # =====================================================
 
     def validate(self) -> "AdaptiveMaskConfig":
@@ -193,6 +242,16 @@ class AdaptiveMaskConfig:
         if self.coverage_mode not in ("final", "raw"):
             raise ValueError(
                 "coverage_mode must be 'final' or 'raw'."
+            )
+
+        if self.coverage_rule not in ("entropy", "mass", "fixed"):
+            raise ValueError(
+                "coverage_rule must be 'entropy', 'mass' or 'fixed'."
+            )
+
+        if self.mask_saliency_sigma < 0:
+            raise ValueError(
+                "mask_saliency_sigma must be >= 0."
             )
 
         # Multi-region

@@ -80,6 +80,77 @@ def _normalized_entropy(
 
 
 # =========================================================
+# 1b. SALIENCY SMOOTHING AND MASS-BASED COVERAGE  (M5-v2)
+# =========================================================
+
+def _smooth_saliency(
+    saliency: torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    """Separable Gaussian blur of a [B, 1, H, W] saliency map.
+
+    Re-normalized per image by its maximum so values stay in [0, 1].
+    sigma <= 0 returns the input unchanged.
+    """
+
+    if sigma is None or sigma <= 0:
+        return saliency
+
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+
+    coords = torch.arange(
+        -radius,
+        radius + 1,
+        device=saliency.device,
+        dtype=saliency.dtype,
+    )
+
+    kernel = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+
+    x = F.pad(saliency, (radius, radius, 0, 0), mode="replicate")
+    x = F.conv2d(x, kernel.view(1, 1, 1, -1))
+    x = F.pad(x, (0, 0, radius, radius), mode="replicate")
+    x = F.conv2d(x, kernel.view(1, 1, -1, 1))
+
+    peak = x.flatten(1).max(dim=1).values.clamp_min(1e-12)
+
+    return (x / peak.view(-1, 1, 1, 1)).clamp(0.0, 1.0)
+
+
+def _mass_coverage(
+    saliency: torch.Tensor,
+    mass_ratio: float,
+    eps: float,
+) -> torch.Tensor:
+    """Fraction of pixels needed to hold `mass_ratio` of the saliency mass.
+
+    Args:
+        saliency: Non-negative saliency [B, 1, H, W].
+        mass_ratio: Target share of total saliency, in (0, 1].
+
+    Returns:
+        Coverage per image [B], in (0, 1].
+    """
+
+    flat = saliency.flatten(1)
+    num_pixels = flat.shape[1]
+
+    sorted_values = torch.sort(flat, dim=1, descending=True).values
+
+    cumulative = sorted_values.cumsum(dim=1)
+    total = cumulative[:, -1:].clamp_min(eps)
+    cumulative = cumulative / total
+
+    # number of pixels whose cumulative share is still below the ratio,
+    # plus the pixel that crosses it
+    needed = (cumulative < mass_ratio).sum(dim=1) + 1
+    needed = needed.clamp(1, num_pixels)
+
+    return needed.to(saliency.dtype) / num_pixels
+
+
+# =========================================================
 # 2. EXACT TOP-K MASK GENERATION
 # =========================================================
 
@@ -491,6 +562,16 @@ def generate_adaptive_mask(
         )
 
     # -----------------------------------------------------
+    # 6.3b OPTIONAL SALIENCY SMOOTHING (M5-v2)
+    # -----------------------------------------------------
+
+    # Top-k, entropy and mass are all computed on the smoothed map, so the
+    # selected pixels form compact regions instead of scattered dots.
+    saliency_sigma = float(getattr(config, "mask_saliency_sigma", 0.0))
+
+    saliency = _smooth_saliency(saliency, saliency_sigma)
+
+    # -----------------------------------------------------
     # 6.4 COMPUTE NORMALIZED ENTROPY
     # -----------------------------------------------------
 
@@ -499,12 +580,36 @@ def generate_adaptive_mask(
         config.eps,
     )
 
+    coverage_rule = getattr(config, "coverage_rule", "entropy")
+
+    mass_coverage = _mass_coverage(
+        saliency,
+        config.saliency_mass_ratio,
+        config.eps,
+    )
+
     # -----------------------------------------------------
-    # 6.5 ENTROPY-AWARE ADAPTIVE COVERAGE
+    # 6.5 ADAPTIVE COVERAGE
     # -----------------------------------------------------
 
-    if config.adaptive_coverage_enabled:
+    if config.adaptive_coverage_enabled and coverage_rule == "mass":
 
+        # Smallest region holding `saliency_mass_ratio` of the evidence.
+        coverage = mass_coverage.clamp(
+            config.min_coverage,
+            config.max_coverage,
+        )
+
+    elif config.adaptive_coverage_enabled and coverage_rule == "fixed":
+
+        coverage = torch.full_like(
+            entropy,
+            config.max_coverage,
+        )
+
+    elif config.adaptive_coverage_enabled:
+
+        # Legacy entropy rule.
         entropy_factor = (
             config.entropy_coverage_strength * entropy
         ).clamp(0.0, 1.0)
@@ -621,6 +726,12 @@ def generate_adaptive_mask(
             ),
 
             "coverage_mode": coverage_mode,
+
+            "coverage_rule": coverage_rule,
+
+            "mass_coverage": mass_coverage.detach(),
+
+            "saliency_sigma": saliency_sigma,
 
             "final_coverage": final_coverage.detach(),
 
